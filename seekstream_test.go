@@ -1,66 +1,79 @@
 package seekstream
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"testing"
 )
 
-type chanReader struct {
+type testReader struct {
 	cond    *sync.Cond // Broadcasts when reader is blocked and when a read completes. Its lock protects the following.
-	ch      <-chan []byte
-	buf     []byte
+	buf     *bytes.Buffer
 	blocked bool
+	closed  bool
 }
 
-func (r *chanReader) Read(p []byte) (int, error) {
-	var n int
-
+func (r *testReader) Read(p []byte) (int, error) {
 	r.cond.L.Lock()
-	defer func() {
-		r.blocked = false
-		r.cond.Broadcast()
-		r.cond.L.Unlock()
-	}()
+	defer r.cond.L.Unlock()
+	defer r.cond.Broadcast()
 
-	for {
-		if len(r.buf) > 0 {
-			n = copy(p, r.buf)
-			r.buf = r.buf[n:]
-			p = p[n:]
-		}
-		if len(p) == 0 {
-			return n, nil
-		}
-
-		var (
-			buf []byte
-			ok  bool
-		)
-
-		select {
-		case buf, ok = <-r.ch:
-			if !ok {
-				return n, io.EOF
-			}
-
-		default:
-			r.blocked = true
-			r.cond.Broadcast()
-
-			r.cond.L.Unlock()
-			buf, ok = <-r.ch
-			r.cond.L.Lock()
-
-			if !ok {
-				return n, io.EOF
-			}
-		}
-
-		r.buf = append(r.buf, buf...)
+	if r.closed || len(p) <= r.buf.Len() {
+		return r.buf.Read(p)
 	}
+
+	r.blocked = true
+	r.cond.Broadcast()
+
+	for !r.closed && len(p) > r.buf.Len() {
+		r.cond.Wait()
+	}
+
+	return r.buf.Read(p)
+}
+
+func (r *testReader) ReadByte() (byte, error) {
+	r.cond.L.Lock()
+	defer r.cond.L.Unlock()
+	defer r.cond.Broadcast()
+
+	if r.closed || r.buf.Len() > 0 {
+		return r.buf.ReadByte()
+	}
+
+	r.blocked = true
+	r.cond.Broadcast()
+
+	for !r.closed && r.buf.Len() == 0 {
+		r.cond.Wait()
+	}
+
+	return r.buf.ReadByte()
+}
+
+func (r *testReader) Write(p []byte) (int, error) {
+	r.cond.L.Lock()
+	defer r.cond.L.Unlock()
+	defer r.cond.Broadcast()
+
+	if r.closed {
+		return 0, io.ErrClosedPipe
+	}
+
+	return r.buf.Write(p)
+}
+
+func (r *testReader) Close() error {
+	r.cond.L.Lock()
+	defer r.cond.L.Unlock()
+	defer r.cond.Broadcast()
+
+	r.closed = true
+	return nil
 }
 
 func TestFile(t *testing.T) {
@@ -69,27 +82,25 @@ func TestFile(t *testing.T) {
 	defer cancel()
 
 	var (
-		ch   = make(chan []byte)
 		mu   = &sync.Mutex{}
 		cond = sync.NewCond(mu)
-		chr  = &chanReader{cond: cond, ch: ch}
+		tr   = &testReader{cond: cond, buf: new(bytes.Buffer)}
 	)
 
-	f, err := New(ctx, chr)
+	f, err := New(ctx, tr)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer f.Close()
 
-	t.Log("waiting for reader to block")
 	mu.Lock()
-	for !chr.blocked {
+	for !tr.blocked {
 		cond.Wait()
 	}
 	mu.Unlock()
 
-	t.Log("writing 9 bytes to channel")
-	ch <- []byte("123456789")
+	t.Log("writing 9 bytes to testReader")
+	fmt.Fprint(tr, "123456789")
 
 	t.Log("reading 4 bytes")
 	var got [4]byte
@@ -125,14 +136,14 @@ func TestFile(t *testing.T) {
 
 	t.Log("waiting for reader to block")
 	mu.Lock()
-	for !chr.blocked {
+	for !tr.blocked {
 		cond.Wait()
 	}
 	mu.Unlock()
 
-	t.Log("writing final 2 bytes to channel")
-	ch <- []byte("xy")
-	close(ch)
+	t.Log("writing final 2 bytes to testReader")
+	fmt.Fprint(tr, "xy")
+	tr.Close()
 
 	t.Log("waiting for goroutine to complete")
 	<-done

@@ -4,10 +4,12 @@
 package seekstream
 
 import (
+	"bufio"
 	"context"
 	"io"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/bobg/errors"
 )
@@ -42,19 +44,130 @@ func New(ctx context.Context, r io.Reader) (*File, error) {
 		tmpfile: tmpfile.Name(),
 	}
 
-	go func() {
-		a := appender{
-			file: result,
-		}
-		_, err := io.Copy(a, cancelReader{ctx: ctx, r: r})
-		result.cond.L.Lock()
-		result.err = err
-		result.eof = true
-		result.cond.Broadcast()
-		result.cond.L.Unlock()
-	}()
+	go result.populate(ctx)
 
 	return result, nil
+}
+
+type bytereader interface {
+	io.ByteReader
+	io.Reader
+}
+
+// Populate reads from the source and writes to the temporary file.
+func (f *File) populate(ctx context.Context) {
+	ch := make(chan byte, 32768)
+
+	// This goroutine produces the bytes of the source on a channel.
+	// Reading that channel,
+	// we can multiplex with a ticker and context cancellation.
+	go func() {
+		defer close(ch)
+
+		var br bytereader
+		if r, ok := f.source.(bytereader); ok {
+			br = r
+		} else {
+			br = bufio.NewReader(f.source)
+		}
+
+		for {
+			b, err := br.ReadByte()
+			if errors.Is(err, io.EOF) {
+				return
+			}
+			if err != nil {
+				f.cond.L.Lock()
+				f.err = errors.Join(f.err, err)
+				f.cond.L.Unlock()
+				return
+			}
+			select {
+			case ch <- b:
+				// ok, do nothing
+
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	defer f.cond.Broadcast()
+
+	var (
+		buf    [32768]byte
+		n      = 0 // counts how much of buf is filled
+		ticker = time.NewTicker(time.Second)
+	)
+
+	defer ticker.Stop()
+
+	// Consume the bytes of the source from the channel and write them to the temporary file.
+	// Add bytes when the buffer is full or when the ticker fires.
+	for {
+		if n == len(buf) {
+			if err := f.append(buf[:]); err != nil {
+				f.cond.L.Lock()
+				f.err = errors.Join(f.err, err)
+				f.cond.L.Unlock()
+				return
+			}
+			n = 0
+		}
+		select {
+		case b, ok := <-ch:
+			if !ok {
+				err := f.append(buf[:n])
+				f.cond.L.Lock()
+				f.eof = true
+				f.err = errors.Join(f.err, err)
+				f.cond.L.Unlock()
+				return
+			}
+			buf[n] = b
+			n++
+
+		case <-ticker.C:
+			if n == 0 {
+				continue
+			}
+			if err := f.append(buf[:n]); err != nil {
+				f.cond.L.Lock()
+				f.err = errors.Join(f.err, err)
+				f.cond.L.Unlock()
+				return
+			}
+			n = 0
+
+		case <-ctx.Done():
+			f.cond.L.Lock()
+			f.err = errors.Join(f.err, ctx.Err())
+			f.cond.L.Unlock()
+			return
+		}
+	}
+}
+
+func (f *File) append(buf []byte) error {
+	if len(buf) == 0 {
+		return nil
+	}
+
+	defer f.cond.Broadcast()
+
+	ff, err := os.OpenFile(f.tmpfile, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		return errors.Wrapf(err, "opening %s for appending", f.tmpfile)
+	}
+	defer ff.Close()
+
+	n, err := ff.Write(buf)
+
+	f.cond.L.Lock()
+	f.written += n
+	f.cond.L.Unlock()
+
+	return errors.Wrap(err, "appending to tmpfile")
 }
 
 func (f *File) Read(p []byte) (int, error) {
@@ -70,6 +183,7 @@ func (f *File) Read(p []byte) (int, error) {
 		return 0, errors.Wrap(err, "opening temporary file for read")
 	}
 	defer ff.Close()
+
 	n, err := ff.ReadAt(p, f.offset)
 	f.offset += int64(n)
 
@@ -131,36 +245,4 @@ func (f *File) waitToSeek(offset int64, whence int) bool {
 		return offset > 0
 	}
 	return false
-}
-
-type appender struct {
-	file *File
-}
-
-func (a appender) Write(p []byte) (int, error) {
-	a.file.cond.L.Lock()
-	defer a.file.cond.L.Unlock()
-
-	f, err := os.OpenFile(a.file.tmpfile, os.O_APPEND|os.O_WRONLY, 0)
-	if err != nil {
-		return 0, errors.Wrap(err, "opening temporary file for append")
-	}
-	defer f.Close()
-
-	n, err := f.Write(p)
-	a.file.written += n
-	a.file.cond.Broadcast()
-	return n, errors.Wrap(err, "writing to temporary file")
-}
-
-type cancelReader struct {
-	ctx context.Context
-	r   io.Reader
-}
-
-func (r cancelReader) Read(p []byte) (int, error) {
-	if err := r.ctx.Err(); err != nil {
-		return 0, err
-	}
-	return r.r.Read(p)
 }
