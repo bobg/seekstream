@@ -27,7 +27,10 @@ type File struct {
 	err         error
 }
 
-var _ io.ReadSeekCloser = &File{}
+var (
+	_ io.ReadSeekCloser = &File{}
+	_ io.ByteReader     = &File{}
+)
 
 func New(ctx context.Context, r io.Reader) (*File, error) {
 	tmpfile, err := os.CreateTemp("", "seekstream")
@@ -190,6 +193,12 @@ func (f *File) Read(p []byte) (int, error) {
 	err = errors.Join(err, f.err)
 
 	return n, errors.Wrap(err, "reading from temporary file")
+}
+
+func (f *File) ReadByte() (byte, error) {
+	var buf [1]byte
+	_, err := f.Read(buf[:])
+	return buf[0], err
 }
 
 func (f *File) Seek(offset int64, whence int) (int64, error) {
