@@ -17,8 +17,6 @@ import (
 type File struct {
 	source io.Reader
 
-	ctx context.Context
-
 	cond        *sync.Cond // protects the following
 	written     int
 	offset      int64
@@ -30,6 +28,7 @@ type File struct {
 var (
 	_ io.ReadSeekCloser = &File{}
 	_ io.ByteReader     = &File{}
+	_ io.ReaderAt       = &File{}
 )
 
 func New(ctx context.Context, r io.Reader) (*File, error) {
@@ -57,9 +56,11 @@ type bytereader interface {
 	io.Reader
 }
 
+const bufsize = 32768
+
 // Populate reads from the source and writes to the temporary file.
 func (f *File) populate(ctx context.Context) {
-	ch := make(chan byte, 32768)
+	ch := make(chan byte, bufsize)
 
 	// This goroutine produces the bytes of the source on a channel.
 	// Reading that channel,
@@ -98,7 +99,7 @@ func (f *File) populate(ctx context.Context) {
 	defer f.cond.Broadcast()
 
 	var (
-		buf    [32768]byte
+		buf    [bufsize]byte
 		n      = 0 // counts how much of buf is filled
 		ticker = time.NewTicker(time.Second)
 	)
@@ -192,7 +193,7 @@ func (f *File) Read(p []byte) (int, error) {
 
 	err = errors.Join(err, f.err)
 
-	return n, errors.Wrap(err, "reading from temporary file")
+	return n, err // "Read must return EOF itself, not an error wrapping EOF, because callers will test for EOF using ==" (https://golang.org/pkg/io/#pkg-variables)
 }
 
 func (f *File) ReadByte() (byte, error) {
@@ -209,17 +210,27 @@ func (f *File) Seek(offset int64, whence int) (int64, error) {
 		f.cond.Wait()
 	}
 
+	newOffset := f.offset
+
 	switch whence {
 	case io.SeekStart:
-		f.offset = offset
+		newOffset = offset
 	case io.SeekCurrent:
-		f.offset += offset
+		newOffset += offset
 	case io.SeekEnd:
-		f.offset = int64(f.written) + offset
+		newOffset = int64(f.written) + offset
 	}
+
+	if newOffset < 0 {
+		return 0, errors.Join(ErrBadSeek, f.err)
+	}
+
+	f.offset = newOffset
 
 	return f.offset, f.err
 }
+
+var ErrBadSeek = errors.New("bad seek")
 
 func (f *File) Close() error {
 	f.cond.L.Lock()
@@ -251,7 +262,7 @@ func (f *File) waitToSeek(offset int64, whence int) bool {
 	case io.SeekCurrent:
 		return f.offset+offset > int64(f.written)
 	case io.SeekEnd:
-		return offset > 0
+		return true // Can't seek relative to the end until we know the end (f.eof is true).
 	}
 	return false
 }
