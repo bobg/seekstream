@@ -28,7 +28,6 @@ type File struct {
 var (
 	_ io.ReadSeekCloser = &File{}
 	_ io.ByteReader     = &File{}
-	_ io.ReaderAt       = &File{}
 )
 
 func New(ctx context.Context, r io.Reader) (*File, error) {
